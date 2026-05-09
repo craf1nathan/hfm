@@ -71,15 +71,19 @@ Every design choice is tested against the M1 reality: **tiny edges + high noise 
 ---
 
 ## Phase 1: Data Pipeline – Synchronisation, Cleaning & Splitting
-
+Need a data_config.json to store all parameters
 ### 1.1 Universe Selection
-- **Target (X):** The instrument to trade.
+- **Target (X):** The instrument to trade. /to setup on data_config.json
 - **Predictors (A–N):** Assets with demonstrable, logical relationships to X.
-  - *Example:* X = EURUSD → A=GBPUSD, B=USDJPY, C=DAX, D=US10Y, E=VIX, F=GOLD.
+  - *Example:* X = EURUSD → A=GBPUSD, B=USDJPY, C=DAX, D=US10Y, E=VIX, F=GOLD. /to setup on data_config.json
 - **Minimum** 3 predictors, **maximum** 8 to keep the search space manageable and avoid excessive multicollinearity.
+- The data folder location should be configurable on data_config.json data config naming is like XAUUSD_M1.csv 
+- The content of each ohlcv data is always like:
+    timestamp,open,high,low,close,volume
+    2025-12-07 22:21:00+00:00,63.815,63.815,63.802,63.81,0
 
 ### 1.2 Temporal Alignment (Master Clock)
-- All assets are aligned to **Asset X’s M1 timestamp index** in UTC.
+- All assets are aligned to **Asset X’s M1 timestamp index** in UTC. 
 - **Rule:** Forward‑fill missing bars (market closed/illiquid) **only**. Never backward‑fill.
 - Flag filled bars with `is_filled = 1`, leave gaps >5 bars as session‑breaks.
 - Drop bars where X has no data.
@@ -87,14 +91,8 @@ Every design choice is tested against the M1 reality: **tiny edges + high noise 
 ### 1.3 Data Cleaning
 | Issue | Handling |
 |-------|----------|
-| Price spikes (>3σ from 20‑bar median) | Winsorize or remove the bar |
-| Zero‑volume bars | Flag, use only if spread is also missing |
 | Duplicate timestamps | Keep last, log occurrence |
 | Weekends / holidays | Remove entirely |
-
-Add two **survival features** directly to the raw data:
-- `spread_X`: Bid‑Ask spread of Asset X at every bar.
-- `tick_activity_i`: Normalised tick volume of each predictor asset.
 
 ### 1.4 Session Labelling
 Each bar receives a session tag (used later as a filter gene):
@@ -109,9 +107,9 @@ Each bar receives a session tag (used later as a filter gene):
 
 ### 1.5 Sacred Data Splitting
 Adopt a **three‑tier split** to completely isolate final validation:
-- **Training Window (In‑Sample)** – Years 1–2  
-- **Validation Window (OOS‑1)** – Year 3 (used for early stopping & model selection)  
-- **Final Test Window (OOS‑2)** – Year 4 (untouchable until Phase 6)
+- **Training Window (In‑Sample)** – Months 3 to 6 /to setup on pipeline_config.json
+- **Validation Window (OOS‑1)** – Months 1 to 2 /to setup on pipeline_config.json
+- **Final Test Window (OOS‑2)** – > 1 year /to setup on pipeline_config.json
 
 *This preserves a completely unseen period for the ultimate go/no‑go decision.*
 
