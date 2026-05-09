@@ -1,0 +1,15 @@
+{
+  "target_symbol": "EURUSD",
+  "predictor_symbols": [
+    "GBPUSD",
+    "USDJPY",
+    "DAX",
+    "US10Y",
+    "VIX",
+    "XAUUSD"
+  ],
+  "data_folder": "./data/",
+  "file_suffix": "_M1.csv",
+  "max_predictors": 8,
+  "min_predictors": 3
+}
