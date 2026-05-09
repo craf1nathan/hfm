@@ -1,7 +1,11 @@
 """
 Phase 1 – Data Pipeline
-Load · Clean · Align · Label · Split
-Designed for Jupyter import: from src.phase1_data_pipeline import *
+Load · Clean · Align · Session Label · Split
+
+Usage in Jupyter:
+    import sys; sys.path.append("..")
+    from src.phase1_data_pipeline import run_pipeline
+    splits, master, reports = run_pipeline()
 """
 
 import json
@@ -9,33 +13,53 @@ from pathlib import Path
 import pandas as pd
 
 
-# ── Config ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
 
 def load_configs(
-    data_cfg_path: str = "config/data_config.json",
+    data_cfg_path:     str = "config/data_config.json",
     pipeline_cfg_path: str = "config/pipeline_config.json"
 ) -> tuple[dict, dict]:
-    """Load both config files. Returns (data_cfg, pipeline_cfg)."""
+    """
+    Load and validate both config files.
+    Raises AssertionError if predictor count violates min/max.
+    Returns (data_cfg, pipeline_cfg).
+    """
     with open(data_cfg_path)     as f: data_cfg     = json.load(f)
-    with open(pipeline_cfg_path) as f: pipeline_cfg  = json.load(f)
+    with open(pipeline_cfg_path) as f: pipeline_cfg = json.load(f)
 
-    n = len(data_cfg["predictor_symbols"])
-    assert data_cfg["min_predictors"] <= n <= data_cfg["max_predictors"], (
-        f"predictor count {n} outside [{data_cfg['min_predictors']}, "
-        f"{data_cfg['max_predictors']}]"
+    n   = len(data_cfg["predictor_symbols"])
+    mn  = data_cfg["min_predictors"]
+    mx  = data_cfg["max_predictors"]
+    assert mn <= n <= mx, (
+        f"predictor count={n} must be between {mn} and {mx}. "
+        f"Edit predictor_symbols in data_config.json."
     )
     return data_cfg, pipeline_cfg
 
 
-# ── Load ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. LOAD
+# ─────────────────────────────────────────────────────────────────────────────
 
 def load_symbol(symbol: str, data_cfg: dict) -> pd.DataFrame:
     """
-    Load one symbol CSV → clean DatetimeIndex (UTC).
-    Expected columns: timestamp, open, high, low, close, volume
+    Read one <SYMBOL>_M1.csv → DataFrame with UTC DatetimeIndex.
+    Expected CSV columns: timestamp, open, high, low, close, volume
     """
-    path = Path(data_cfg["data_folder"]) / f"{symbol}{data_cfg['file_suffix']}"
-    df = pd.read_csv(path, parse_dates=["timestamp"], index_col="timestamp")
+    path = (
+        Path(data_cfg["data_folder"])
+        / f"{symbol}{data_cfg['file_suffix']}"
+    )
+    if not path.exists():
+        raise FileNotFoundError(f"Data file not found: {path}")
+
+    df = pd.read_csv(
+        path,
+        parse_dates=["timestamp"],
+        index_col="timestamp"
+    )
 
     # Ensure UTC-aware index
     if df.index.tz is None:
@@ -43,93 +67,114 @@ def load_symbol(symbol: str, data_cfg: dict) -> pd.DataFrame:
     else:
         df.index = df.index.tz_convert("UTC")
 
+    df.index.name = "timestamp"
     df.sort_index(inplace=True)
-    df = df[["open", "high", "low", "close", "volume"]]
-    return df
+    return df[["open", "high", "low", "close", "volume"]]
 
 
-# ── Clean ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. CLEAN
+# ─────────────────────────────────────────────────────────────────────────────
 
 def clean_symbol(df: pd.DataFrame, symbol: str = "") -> tuple[pd.DataFrame, dict]:
     """
-    Per-symbol cleaning:
-      - Drop duplicate timestamps (keep last)
-      - Drop weekends (Saturday=5, Sunday=6)
-      - Drop rows with non-positive OHLC
-    Returns cleaned df + report dict.
+    Clean one symbol DataFrame:
+      • Duplicate timestamps → keep last
+      • Weekend bars        → drop (dayofweek 5=Sat, 6=Sun)
+      • Non-positive OHLC   → drop
+
+    Returns (cleaned_df, report_dict).
     """
-    report = {"symbol": symbol, "raw_bars": len(df)}
+    report = {
+        "symbol":                symbol,
+        "raw_bars":              len(df),
+        "duplicates_removed":    0,
+        "weekend_bars_removed":  0,
+        "bad_price_bars_removed": 0,
+        "clean_bars":            0,
+    }
 
     # Duplicates
-    dupes = df.index.duplicated(keep="last")
-    report["duplicates_removed"] = int(dupes.sum())
-    df = df[~dupes]
+    mask_dupe = df.index.duplicated(keep="last")
+    report["duplicates_removed"] = int(mask_dupe.sum())
+    df = df[~mask_dupe]
 
     # Weekends
-    is_weekend = df.index.dayofweek >= 5
-    report["weekend_bars_removed"] = int(is_weekend.sum())
-    df = df[~is_weekend]
+    mask_wknd = df.index.dayofweek >= 5
+    report["weekend_bars_removed"] = int(mask_wknd.sum())
+    df = df[~mask_wknd]
 
     # Non-positive prices
-    bad = (df[["open", "high", "low", "close"]] <= 0).any(axis=1)
-    report["bad_price_bars_removed"] = int(bad.sum())
-    df = df[~bad]
+    mask_bad = (df[["open", "high", "low", "close"]] <= 0).any(axis=1)
+    report["bad_price_bars_removed"] = int(mask_bad.sum())
+    df = df[~mask_bad]
 
     report["clean_bars"] = len(df)
     return df, report
 
 
-# ── Align ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. ALIGN
+# ─────────────────────────────────────────────────────────────────────────────
 
 def align_predictors(
-    target: pd.DataFrame,
-    predictors: dict[str, pd.DataFrame],
+    target:       pd.DataFrame,
+    predictors:   dict[str, pd.DataFrame],
     max_fill_gap: int = 5
 ) -> pd.DataFrame:
     """
-    Align all predictors to target's M1 index.
-    - Forward-fill gaps up to max_fill_gap bars (flag with is_filled=1)
-    - Gaps > max_fill_gap remain NaN (session breaks)
-    - Drop rows where target close is NaN
-    Returns single wide DataFrame.
+    Reindex all predictors to target's M1 timestamp index.
+      • Forward-fill up to max_fill_gap consecutive missing bars.
+      • Bars filled this way are flagged: <SYMBOL>_is_filled = 1
+      • Gaps larger than max_fill_gap stay NaN  (session breaks).
+      • Rows where target close is NaN are dropped.
+
+    Returns one wide DataFrame (target cols unprefixed,
+    predictor cols prefixed with <SYMBOL>_).
     """
     master_idx = target.index
 
-    frames = {"": target.copy()}           # target cols: open, high, low, close, volume
-    frames[""]["is_filled"] = 0
+    # ── Target block ─────────────────────────────────────────────────────────
+    tgt = target.copy()
+    tgt["is_filled"] = 0                   # target is always the master clock
 
+    frames = [tgt]
+
+    # ── Predictor blocks ──────────────────────────────────────────────────────
     for sym, df in predictors.items():
-        prefix = f"{sym}_"
-        df_r   = df.reindex(master_idx)    # reindex to master clock
+        df_r    = df.reindex(master_idx)   # align to master clock
+        was_nan = df_r["close"].isna()     # track original missing bars
 
-        was_nan = df_r["close"].isna()
+        df_r    = df_r.ffill(limit=max_fill_gap)   # forward-fill (no backward)
 
-        # Forward-fill with hard limit
-        df_r = df_r.ffill(limit=max_fill_gap)
-
-        # Flag filled bars
+        # is_filled = 1 where bar was missing but is now filled
         df_r["is_filled"] = (was_nan & df_r["close"].notna()).astype(int)
 
-        df_r.columns = [f"{prefix}{c}" for c in df_r.columns]
-        frames[sym] = df_r
+        # Prefix all columns
+        df_r.columns = [f"{sym}_{c}" for c in df_r.columns]
+        frames.append(df_r)
 
-    master = pd.concat(frames.values(), axis=1)
+    master = pd.concat(frames, axis=1)
 
-    # Drop bars where target has no data
-    master = master.dropna(subset=["close"])
+    # Drop bars where the target itself has no data
+    master.dropna(subset=["close"], inplace=True)
+
     return master
 
 
-# ── Session Labels ───────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. SESSION LABELS
+# ─────────────────────────────────────────────────────────────────────────────
 
 def add_session_labels(df: pd.DataFrame, sessions: dict) -> pd.DataFrame:
     """
-    Add integer session column based on UTC hour.
-    sessions: dict from pipeline_config["sessions"]
+    Add integer 'session' column based on UTC hour of each bar.
+    sessions: pipeline_config["sessions"]
+      e.g. {"0": {"name": "Dead_zone", "start_hour": 0, "end_hour": 2}, ...}
     """
-    hour = df.index.hour
-    df   = df.copy()
-    df["session"] = 0                      # default: Dead_zone
+    df        = df.copy()
+    hour      = df.index.hour
+    df["session"] = 0                      # default → Dead_zone
 
     for label, info in sessions.items():
         mask = (hour >= info["start_hour"]) & (hour < info["end_hour"])
@@ -138,82 +183,131 @@ def add_session_labels(df: pd.DataFrame, sessions: dict) -> pd.DataFrame:
     return df
 
 
-# ── Split ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. SPLIT
+# ─────────────────────────────────────────────────────────────────────────────
 
 def split_data(
-    df: pd.DataFrame,
+    df:         pd.DataFrame,
     splits_cfg: dict
 ) -> dict[str, pd.DataFrame]:
     """
-    Slice master DataFrame into train / validation / test.
-    Dates come from pipeline_config["splits"].
-    Returns dict with keys: train, validation, test.
+    Slice master DataFrame into named windows.
+    splits_cfg: pipeline_config["splits"]
+      keys: train | validation | test
+      values: {"start": "...", "end": "..."}
+
+    Returns dict[split_name → DataFrame].
     """
     result = {}
     for name, bounds in splits_cfg.items():
-        mask = (df.index >= bounds["start"]) & (df.index <= bounds["end"])
-        result[name] = df[mask].copy()
+        mask          = (df.index >= bounds["start"]) & (df.index <= bounds["end"])
+        result[name]  = df.loc[mask].copy()
     return result
 
 
-# ── Master Runner ────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. MASTER RUNNER
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run_pipeline(
-    data_cfg_path:     str = "config/data_config.json",
-    pipeline_cfg_path: str = "config/pipeline_config.json",
+    data_cfg_path:     str  = "config/data_config.json",
+    pipeline_cfg_path: str  = "config/pipeline_config.json",
     verbose:           bool = True
 ) -> tuple[dict[str, pd.DataFrame], pd.DataFrame, dict]:
     """
-    Full Phase 1 pipeline.
+    Execute the full Phase 1 pipeline.
+
+    Parameters
+    ----------
+    data_cfg_path     : path to data_config.json
+    pipeline_cfg_path : path to pipeline_config.json
+    verbose           : print progress summary to stdout
 
     Returns
     -------
-    splits  : dict  – {"train": df, "validation": df, "test": df}
-    master  : df    – full aligned + labelled DataFrame
-    reports : dict  – cleaning reports per symbol
+    splits  : dict  {"train": df, "validation": df, "test": df}
+    master  : pd.DataFrame  full aligned + labelled dataset
+    reports : dict  per-symbol cleaning report
     """
+
+    # ── Config ────────────────────────────────────────────────────────────────
     data_cfg, pipeline_cfg = load_configs(data_cfg_path, pipeline_cfg_path)
+    target_sym             = data_cfg["target_symbol"]
+    predictor_syms         = data_cfg["predictor_symbols"]
 
-    # ── Load & clean target ──────────────────────────────────────────────────
-    target_sym  = data_cfg["target_symbol"]
-    target_raw  = load_symbol(target_sym, data_cfg)
-    target, rpt = clean_symbol(target_raw, target_sym)
-    reports     = {target_sym: rpt}
+    _hdr("PHASE 1 — DATA PIPELINE", verbose)
 
+    # ── Load + clean target ───────────────────────────────────────────────────
+    _log("Loading & cleaning target", verbose)
+    target_raw, rpt_t = clean_symbol(load_symbol(target_sym, data_cfg), target_sym)
+    reports           = {target_sym: rpt_t}
+    _print_report(rpt_t, tag="TARGET", verbose=verbose)
+
+    # ── Load + clean predictors ───────────────────────────────────────────────
+    _log("Loading & cleaning predictors", verbose)
+    predictors: dict[str, pd.DataFrame] = {}
+    for sym in predictor_syms:
+        df_clean, rpt = clean_symbol(load_symbol(sym, data_cfg), sym)
+        predictors[sym] = df_clean
+        reports[sym]    = rpt
+        _print_report(rpt, tag="PRED  ", verbose=verbose)
+
+    # ── Align ─────────────────────────────────────────────────────────────────
+    _log("Aligning to master clock (target index)", verbose)
+    master = align_predictors(target_raw, predictors, pipeline_cfg["max_fill_gap"])
     if verbose:
-        print(f"[TARGET]  {target_sym}: {rpt['clean_bars']:,} bars "
-              f"| dupes removed: {rpt['duplicates_removed']} "
-              f"| weekends: {rpt['weekend_bars_removed']}")
+        print(f"         shape : {master.shape}")
+        print(f"         range : {master.index[0]}  →  {master.index[-1]}")
 
-    # ── Load & clean predictors ──────────────────────────────────────────────
-    predictors = {}
-    for sym in data_cfg["predictor_symbols"]:
-        raw, rpt_p   = clean_symbol(load_symbol(sym, data_cfg), sym)
-        predictors[sym] = raw
-        reports[sym]    = rpt_p
-        if verbose:
-            print(f"[PRED]    {sym}: {rpt_p['clean_bars']:,} bars "
-                  f"| dupes: {rpt_p['duplicates_removed']} "
-                  f"| weekends: {rpt_p['weekend_bars_removed']}")
-
-    # ── Align ────────────────────────────────────────────────────────────────
-    master = align_predictors(target, predictors, pipeline_cfg["max_fill_gap"])
-    if verbose:
-        print(f"\n[ALIGN]   Master shape: {master.shape} "
-              f"| {master.index[0]} → {master.index[-1]}")
-
-    # ── Session labels ───────────────────────────────────────────────────────
+    # ── Session labels ────────────────────────────────────────────────────────
+    _log("Assigning session labels", verbose)
     master = add_session_labels(master, pipeline_cfg["sessions"])
     if verbose:
-        print(f"[SESSION] Distribution:\n"
-              f"{master['session'].value_counts().sort_index().to_string()}\n")
+        dist = master["session"].value_counts().sort_index()
+        names = {
+            int(k): v["name"]
+            for k, v in pipeline_cfg["sessions"].items()
+        }
+        for tag, count in dist.items():
+            print(f"         [{tag}] {names[tag]:<12} : {count:>10,} bars")
 
-    # ── Split ────────────────────────────────────────────────────────────────
+    # ── Split ─────────────────────────────────────────────────────────────────
+    _log("Splitting data", verbose)
     splits = split_data(master, pipeline_cfg["splits"])
     if verbose:
         for name, df in splits.items():
-            sacred = " ⚠️  SACRED — do not touch until final go/no-go" if name == "test" else ""
-            print(f"[SPLIT]   {name:<12}: {len(df):>8,} bars "
-                  f"| {df.index[0]} → {df.index[-1]}{sacred}")
+            sacred = "  ⚠️  SACRED" if name == "test" else ""
+            print(
+                f"         {name:<12} : {len(df):>8,} bars"
+                f"  {df.index[0]}  →  {df.index[-1]}{sacred}"
+            )
 
+    _hdr("PHASE 1 COMPLETE", verbose)
     return splits, master, reports
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS (internal)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _hdr(msg: str, verbose: bool) -> None:
+    if verbose:
+        print(f"\n{'─' * 60}")
+        print(f"  {msg}")
+        print(f"{'─' * 60}")
+
+def _log(msg: str, verbose: bool) -> None:
+    if verbose:
+        print(f"\n[·] {msg}")
+
+def _print_report(rpt: dict, tag: str, verbose: bool) -> None:
+    if verbose:
+        print(
+            f"    [{tag}] {rpt['symbol']:<10} "
+            f"raw={rpt['raw_bars']:>9,}  "
+            f"clean={rpt['clean_bars']:>9,}  "
+            f"dupes={rpt['duplicates_removed']:>4}  "
+            f"wknd={rpt['weekend_bars_removed']:>6,}  "
+            f"bad_px={rpt['bad_price_bars_removed']:>3}"
+        )
