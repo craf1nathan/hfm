@@ -1,12 +1,13 @@
 {
-  "target_symbol": "EURUSD",
+  "target_symbol": "XAUUSD",
   "predictor_symbols": [
-    "GBPUSD",
+    "BCOUSD",
     "USDJPY",
-    "DAX",
-    "US10Y",
-    "VIX",
-    "XAUUSD"
+    "EURUSD",
+    "NSXUSD",
+    "SPXUSD",
+    "UDXUSD",
+    "XAGUSD"
   ],
   "data_folder": "./data/",
   "file_suffix": "_M1.csv",
