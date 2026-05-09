@@ -9,7 +9,7 @@
     "UDXUSD",
     "XAGUSD"
   ],
-  "data_folder": "./data/",
+  "data_folder": "../data/",
   "file_suffix": "_M1.csv",
   "max_predictors": 8,
   "min_predictors": 3

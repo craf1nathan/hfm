@@ -23,19 +23,35 @@ def load_configs(
 ) -> tuple[dict, dict]:
     """
     Load and validate both config files.
-    Raises AssertionError if predictor count violates min/max.
+    Injects resolved absolute 'data_folder' so all downstream
+    functions are path-agnostic regardless of working directory.
     Returns (data_cfg, pipeline_cfg).
     """
+    data_cfg_path     = Path(data_cfg_path).resolve()
+    pipeline_cfg_path = Path(pipeline_cfg_path).resolve()
+
     with open(data_cfg_path)     as f: data_cfg     = json.load(f)
     with open(pipeline_cfg_path) as f: pipeline_cfg = json.load(f)
 
-    n   = len(data_cfg["predictor_symbols"])
-    mn  = data_cfg["min_predictors"]
-    mx  = data_cfg["max_predictors"]
+    # ── Resolve data_folder relative to data_config.json location ────────────
+    raw_folder = data_cfg["data_folder"]          # e.g.  "./data/"
+    if not Path(raw_folder).is_absolute():
+        # anchor to the directory that contains data_config.json
+        resolved = (data_cfg_path.parent / raw_folder).resolve()
+    else:
+        resolved = Path(raw_folder).resolve()
+
+    data_cfg["data_folder"] = str(resolved)       # overwrite with absolute path
+
+    # ── Predictor count guard ─────────────────────────────────────────────────
+    n  = len(data_cfg["predictor_symbols"])
+    mn = data_cfg["min_predictors"]
+    mx = data_cfg["max_predictors"]
     assert mn <= n <= mx, (
         f"predictor count={n} must be between {mn} and {mx}. "
         f"Edit predictor_symbols in data_config.json."
     )
+
     return data_cfg, pipeline_cfg
 
 
@@ -47,13 +63,17 @@ def load_symbol(symbol: str, data_cfg: dict) -> pd.DataFrame:
     """
     Read one <SYMBOL>_M1.csv → DataFrame with UTC DatetimeIndex.
     Expected CSV columns: timestamp, open, high, low, close, volume
+    data_cfg["data_folder"] is always an absolute path (set by load_configs).
     """
-    path = (
-        Path(data_cfg["data_folder"])
-        / f"{symbol}{data_cfg['file_suffix']}"
-    )
+    path = Path(data_cfg["data_folder"]) / f"{symbol}{data_cfg['file_suffix']}"
+
     if not path.exists():
-        raise FileNotFoundError(f"Data file not found: {path}")
+        raise FileNotFoundError(
+            f"\n  File not found : {path}"
+            f"\n  data_folder    : {data_cfg['data_folder']}"
+            f"\n  symbol         : {symbol}"
+            f"\n  Check data_config.json → data_folder and that the CSV exists."
+        )
 
     df = pd.read_csv(
         path,
@@ -80,18 +100,17 @@ def clean_symbol(df: pd.DataFrame, symbol: str = "") -> tuple[pd.DataFrame, dict
     """
     Clean one symbol DataFrame:
       • Duplicate timestamps → keep last
-      • Weekend bars        → drop (dayofweek 5=Sat, 6=Sun)
-      • Non-positive OHLC   → drop
-
+      • Weekend bars         → drop  (dayofweek 5=Sat, 6=Sun)
+      • Non-positive OHLC    → drop
     Returns (cleaned_df, report_dict).
     """
     report = {
-        "symbol":                symbol,
-        "raw_bars":              len(df),
-        "duplicates_removed":    0,
-        "weekend_bars_removed":  0,
+        "symbol":                 symbol,
+        "raw_bars":               len(df),
+        "duplicates_removed":     0,
+        "weekend_bars_removed":   0,
         "bad_price_bars_removed": 0,
-        "clean_bars":            0,
+        "clean_bars":             0,
     }
 
     # Duplicates
@@ -125,40 +144,32 @@ def align_predictors(
     """
     Reindex all predictors to target's M1 timestamp index.
       • Forward-fill up to max_fill_gap consecutive missing bars.
-      • Bars filled this way are flagged: <SYMBOL>_is_filled = 1
-      • Gaps larger than max_fill_gap stay NaN  (session breaks).
+      • Filled bars flagged: <SYMBOL>_is_filled = 1
+      • Gaps > max_fill_gap stay NaN  (session breaks).
       • Rows where target close is NaN are dropped.
-
     Returns one wide DataFrame (target cols unprefixed,
     predictor cols prefixed with <SYMBOL>_).
     """
     master_idx = target.index
 
-    # ── Target block ─────────────────────────────────────────────────────────
-    tgt = target.copy()
-    tgt["is_filled"] = 0                   # target is always the master clock
-
-    frames = [tgt]
+    # ── Target block ──────────────────────────────────────────────────────────
+    tgt              = target.copy()
+    tgt["is_filled"] = 0
+    frames           = [tgt]
 
     # ── Predictor blocks ──────────────────────────────────────────────────────
     for sym, df in predictors.items():
-        df_r    = df.reindex(master_idx)   # align to master clock
-        was_nan = df_r["close"].isna()     # track original missing bars
+        df_r    = df.reindex(master_idx)
+        was_nan = df_r["close"].isna()
 
-        df_r    = df_r.ffill(limit=max_fill_gap)   # forward-fill (no backward)
+        df_r    = df_r.ffill(limit=max_fill_gap)
 
-        # is_filled = 1 where bar was missing but is now filled
         df_r["is_filled"] = (was_nan & df_r["close"].notna()).astype(int)
-
-        # Prefix all columns
-        df_r.columns = [f"{sym}_{c}" for c in df_r.columns]
+        df_r.columns      = [f"{sym}_{c}" for c in df_r.columns]
         frames.append(df_r)
 
     master = pd.concat(frames, axis=1)
-
-    # Drop bars where the target itself has no data
     master.dropna(subset=["close"], inplace=True)
-
     return master
 
 
@@ -170,10 +181,9 @@ def add_session_labels(df: pd.DataFrame, sessions: dict) -> pd.DataFrame:
     """
     Add integer 'session' column based on UTC hour of each bar.
     sessions: pipeline_config["sessions"]
-      e.g. {"0": {"name": "Dead_zone", "start_hour": 0, "end_hour": 2}, ...}
     """
-    df        = df.copy()
-    hour      = df.index.hour
+    df            = df.copy()
+    hour          = df.index.hour
     df["session"] = 0                      # default → Dead_zone
 
     for label, info in sessions.items():
@@ -194,15 +204,14 @@ def split_data(
     """
     Slice master DataFrame into named windows.
     splits_cfg: pipeline_config["splits"]
-      keys: train | validation | test
+      keys  : train | validation | test
       values: {"start": "...", "end": "..."}
-
     Returns dict[split_name → DataFrame].
     """
     result = {}
     for name, bounds in splits_cfg.items():
-        mask          = (df.index >= bounds["start"]) & (df.index <= bounds["end"])
-        result[name]  = df.loc[mask].copy()
+        mask         = (df.index >= bounds["start"]) & (df.index <= bounds["end"])
+        result[name] = df.loc[mask].copy()
     return result
 
 
@@ -220,15 +229,15 @@ def run_pipeline(
 
     Parameters
     ----------
-    data_cfg_path     : path to data_config.json
+    data_cfg_path     : path to data_config.json  (absolute or relative)
     pipeline_cfg_path : path to pipeline_config.json
-    verbose           : print progress summary to stdout
+    verbose           : print progress to stdout
 
     Returns
     -------
-    splits  : dict  {"train": df, "validation": df, "test": df}
-    master  : pd.DataFrame  full aligned + labelled dataset
-    reports : dict  per-symbol cleaning report
+    splits  : dict {"train": df, "validation": df, "test": df}
+    master  : pd.DataFrame — full aligned + labelled dataset
+    reports : dict — per-symbol cleaning report
     """
 
     # ── Config ────────────────────────────────────────────────────────────────
@@ -237,6 +246,8 @@ def run_pipeline(
     predictor_syms         = data_cfg["predictor_symbols"]
 
     _hdr("PHASE 1 — DATA PIPELINE", verbose)
+    if verbose:
+        print(f"  data_folder : {data_cfg['data_folder']}")
 
     # ── Load + clean target ───────────────────────────────────────────────────
     _log("Loading & cleaning target", verbose)
@@ -248,7 +259,7 @@ def run_pipeline(
     _log("Loading & cleaning predictors", verbose)
     predictors: dict[str, pd.DataFrame] = {}
     for sym in predictor_syms:
-        df_clean, rpt = clean_symbol(load_symbol(sym, data_cfg), sym)
+        df_clean, rpt   = clean_symbol(load_symbol(sym, data_cfg), sym)
         predictors[sym] = df_clean
         reports[sym]    = rpt
         _print_report(rpt, tag="PRED  ", verbose=verbose)
@@ -264,11 +275,8 @@ def run_pipeline(
     _log("Assigning session labels", verbose)
     master = add_session_labels(master, pipeline_cfg["sessions"])
     if verbose:
-        dist = master["session"].value_counts().sort_index()
-        names = {
-            int(k): v["name"]
-            for k, v in pipeline_cfg["sessions"].items()
-        }
+        dist  = master["session"].value_counts().sort_index()
+        names = {int(k): v["name"] for k, v in pipeline_cfg["sessions"].items()}
         for tag, count in dist.items():
             print(f"         [{tag}] {names[tag]:<12} : {count:>10,} bars")
 
@@ -288,7 +296,7 @@ def run_pipeline(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HELPERS (internal)
+# HELPERS  (internal)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _hdr(msg: str, verbose: bool) -> None:
